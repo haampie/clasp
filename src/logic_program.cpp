@@ -176,7 +176,152 @@ static bool toConstraint(NodeType* node, const LogicProgram& prg, ClauseCreator&
 }
 
 using IdSet    = std::unordered_set<Id_t>;
-using IndexMap = std::unordered_multimap<uint32_t, uint32_t>;
+//! Partial replacement for unordered_multimap with better memory locality.
+class FlatMultiMap {
+public:
+    using value_type = std::pair<uint32_t, uint32_t>;
+    static constexpr uint32_t none = 0xFFFFFFFFu;
+
+private:
+    struct Node {
+        uint32_t key, value, next;
+    };
+    PodVector_t<uint32_t> buckets_;
+    PodVector_t<Node>     nodes_;
+    uint32_t              freeHead_{none};
+    uint32_t              size_{0};
+
+    [[nodiscard]] auto bucket(uint32_t key) const -> uint32_t {
+        return key & (static_cast<uint32_t>(buckets_.size()) - 1);
+    }
+
+    void rehash(uint32_t newBucketCount) {
+        PodVector_t<uint32_t> newBuckets(newBucketCount, none);
+        uint32_t              mask = newBucketCount - 1;
+        for (uint32_t b = 0, n = static_cast<uint32_t>(buckets_.size()); b != n; ++b) {
+            uint32_t cur = buckets_[b];
+            while (cur != none) {
+                uint32_t nextNode = nodes_[cur].next;
+                uint32_t newB     = nodes_[cur].key & mask;
+                nodes_[cur].next  = newBuckets[newB];
+                newBuckets[newB]  = cur;
+                cur               = nextNode;
+            }
+        }
+        buckets_.swap(newBuckets);
+    }
+
+public:
+    FlatMultiMap() = default;
+
+    struct iterator {
+        using iterator_category = std::forward_iterator_tag;
+        using value_type        = FlatMultiMap::value_type;
+        using difference_type   = std::ptrdiff_t;
+        using pointer           = value_type*;
+        using reference         = value_type&;
+
+        const FlatMultiMap* map_{nullptr};
+        uint32_t            idx_{none};
+        uint32_t            key_{0};
+
+        iterator() = default;
+        iterator(const FlatMultiMap* m, uint32_t i, uint32_t k) : map_(m), idx_(i), key_(k) {}
+
+        // arrow proxy so it->second works without dangling pointers
+        struct ArrowProxy {
+            value_type val;
+            auto       operator->() const -> const value_type* { return &val; }
+        };
+
+        auto operator->() const -> ArrowProxy {
+            const auto& nd = map_->nodes_[idx_];
+            return ArrowProxy{value_type{nd.key, nd.value}};
+        }
+        auto operator*() const -> value_type {
+            const auto& nd = map_->nodes_[idx_];
+            return value_type{nd.key, nd.value};
+        }
+        auto operator++() -> iterator& {
+            uint32_t cur = map_->nodes_[idx_].next;
+            while (cur != none) {
+                if (map_->nodes_[cur].key == key_) {
+                    idx_ = cur;
+                    return *this;
+                }
+                cur = map_->nodes_[cur].next;
+            }
+            idx_ = none;
+            return *this;
+        }
+        auto operator==(const iterator& o) const -> bool { return idx_ == o.idx_; }
+    };
+    using const_iterator = iterator;
+
+    [[nodiscard]] auto end() const -> iterator { return iterator(this, none, 0); }
+
+    void emplace(uint32_t key, uint32_t value) {
+        if (buckets_.empty() || size_ >= buckets_.size()) {
+            rehash(buckets_.empty() ? 8u : static_cast<uint32_t>(buckets_.size()) * 2u);
+        }
+        uint32_t ni;
+        Node     nd{key, value, none};
+        if (freeHead_ != none) {
+            ni         = freeHead_;
+            freeHead_  = nodes_[ni].next;
+            nodes_[ni] = nd;
+        }
+        else {
+            ni = static_cast<uint32_t>(nodes_.size());
+            nodes_.push_back(nd);
+        }
+        uint32_t b      = bucket(key);
+        nodes_[ni].next = buckets_[b];
+        buckets_[b]     = ni;
+        ++size_;
+    }
+
+    [[nodiscard]] auto equal_range(uint32_t key) const -> std::pair<iterator, iterator> {
+        if (buckets_.empty()) {
+            return {end(), end()};
+        }
+        uint32_t cur = buckets_[bucket(key)];
+        while (cur != none) {
+            if (nodes_[cur].key == key) {
+                return {iterator(this, cur, key), end()};
+            }
+            cur = nodes_[cur].next;
+        }
+        return {end(), end()};
+    }
+
+    [[nodiscard]] auto find(uint32_t key) const -> iterator { return equal_range(key).first; }
+
+    void erase(iterator it) {
+        uint32_t ni = it.idx_;
+        uint32_t b  = bucket(nodes_[ni].key);
+        if (buckets_[b] == ni) {
+            buckets_[b] = nodes_[ni].next;
+        }
+        else {
+            uint32_t prev = buckets_[b];
+            while (nodes_[prev].next != ni) { prev = nodes_[prev].next; }
+            nodes_[prev].next = nodes_[ni].next;
+        }
+        nodes_[ni].next = freeHead_;
+        freeHead_       = ni;
+        --size_;
+    }
+
+    void clear() {
+        buckets_.clear();
+        nodes_.clear();
+        freeHead_ = none;
+        size_     = 0;
+    }
+};
+
+using IndexMap = FlatMultiMap;
 struct LogicProgram::Aux {
     auto showAtoms(const SharedContext& ctx) const {
         return ctx.output.pred_range().subspan(std::min(show, ctx.output.numPreds()));
